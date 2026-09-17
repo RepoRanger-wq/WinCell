@@ -1,0 +1,11 @@
+# Code-only allowlist. All other local files are ignored by default.
+/*
+!/.gitignore
+!/README.md
+!/WinCell/
+/WinCell/*
+!/WinCell/README.md
+!/WinCell/build.sh
+!/WinCell/Sources/
+/WinCell/Sources/*
+!/WinCell/Sources/main.swift
