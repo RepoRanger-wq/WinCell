@@ -9,12 +9,48 @@ struct VideoClip {
     let thumbnail: NSImage?
 }
 
+enum VideoLibrary {
+    static var directory: URL {
+        if let override = ProcessInfo.processInfo.environment["WINCELL_LIBRARY_DIR"], !override.isEmpty {
+            return URL(fileURLWithPath: (override as NSString).expandingTildeInPath, isDirectory: true)
+        }
+        let movies = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first!
+        return movies.appendingPathComponent("WinCell", isDirectory: true)
+    }
+
+    static func discover(in directory: URL) throws -> [VideoClip] {
+        let manager = FileManager.default
+        try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let folders = try manager.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isDirectoryKey], options: .skipsHiddenFiles)
+        return folders.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }.compactMap { folder in
+            guard (try? folder.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
+                  let files = try? manager.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isRegularFileKey], options: .skipsHiddenFiles) else { return nil }
+            let videos = files.filter {
+                ["mov", "mp4", "m4v"].contains($0.pathExtension.lowercased()) &&
+                (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+            }.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+            // One clip per folder; prefer conventional names over preview files.
+            guard let url = videos.first(where: { $0.lastPathComponent.lowercased() == "video.mov" }) ??
+                    videos.first(where: { $0.lastPathComponent.lowercased() == "transparent.mov" }) ?? videos.first else { return nil }
+            let thumbnail = ["thumbnail.png", "thumbnail.jpg", "thumbnail.jpeg"].compactMap {
+                NSImage(contentsOf: folder.appendingPathComponent($0))
+            }.first
+            if let thumbnail {
+                let scale = min(40 / max(1, thumbnail.size.width), 60 / max(1, thumbnail.size.height))
+                thumbnail.size = NSSize(width: thumbnail.size.width * scale, height: thumbnail.size.height * scale)
+            }
+            return VideoClip(id: url.path, title: folder.lastPathComponent, url: url,
+                             thumbnail: thumbnail ?? NSImage(systemSymbolName: "film", accessibilityDescription: "Video"))
+        }
+    }
+}
+
 final class OverlayWindow: NSWindow {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
     private var toggleItem: NSMenuItem!
@@ -32,23 +68,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var clips: [VideoClip] = []
     private var currentClip: VideoClip?
 
+    private var libraryError: String?
+    private var aspectRatio: CGFloat = 768 / 1168
+
     private func loadClips() {
-        guard let resources = Bundle.main.resourceURL else { return }
-        let library = resources.appendingPathComponent("Videos")
-        let folders = (try? FileManager.default.contentsOfDirectory(at: library, includingPropertiesForKeys: nil)) ?? []
-        clips = folders.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }.compactMap { folder in
-            let url = folder.appendingPathComponent("transparent.mov")
-            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-            let image = NSImage(contentsOf: folder.appendingPathComponent("thumbnail.png"))
-            image?.size = NSSize(width: 40, height: 60)
-            return VideoClip(id: folder.lastPathComponent, title: folder.lastPathComponent, url: url, thumbnail: image)
+        do {
+            clips = try VideoLibrary.discover(in: VideoLibrary.directory)
+            libraryError = nil
+        } catch {
+            clips = []
+            libraryError = "The video folder could not be opened. Check its permissions."
         }
-        if let original = Bundle.main.url(forResource: "WinCell", withExtension: "mov") {
-            let image = NSImage(contentsOf: resources.appendingPathComponent("OriginalThumbnail.png"))
-            image?.size = NSSize(width: 40, height: 60)
-            clips.append(VideoClip(id: "original", title: "Original", url: original,
-                                   thumbnail: image ?? NSImage(systemSymbolName: "film", accessibilityDescription: "Original video")))
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshLibrary()
+    }
+
+    @objc private func refreshLibrary() {
+        loadClips()
+        if running, let currentClip, !FileManager.default.fileExists(atPath: currentClip.url.path) { stop() }
+        buildMenu()
+    }
+
+    @objc private func openVideoFolder() {
+        do {
+            try FileManager.default.createDirectory(at: VideoLibrary.directory, withIntermediateDirectories: true)
+            NSWorkspace.shared.open(VideoLibrary.directory)
+        } catch {
+            showError("Cannot open the video folder", "Check that your Movies folder is writable.")
         }
+    }
+
+    private func showError(_ title: String, _ message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     private func randomClip() -> VideoClip? {
@@ -62,10 +119,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: "WinCell")
         statusItem.button?.toolTip = "WinCell — click to start or stop"
         statusItem.menu = menu
+        menu.delegate = self
         loadClips()
         buildMenu()
         NotificationCenter.default.addObserver(self, selector: #selector(reposition), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         installShortcut()
+        if CommandLine.arguments.contains("--library-test") { libraryTest(); return }
         if CommandLine.arguments.contains("--smoke-test") { smokeTest() }
     }
 
@@ -94,7 +153,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             entry.image = clip.thumbnail
             entry.state = running && currentClip?.id == clip.id ? .on : .off
         }
+        if clips.isEmpty { _ = item("No videos yet — add a clip folder", nil, in: videos) }
         item("Choose Video", nil).submenu = videos
+        _ = item("Open Video Folder…", #selector(openVideoFolder))
+        _ = item("Refresh Videos", #selector(refreshLibrary))
+        if let libraryError { _ = item(libraryError, nil) }
         menu.addItem(.separator())
         let durations = NSMenu()
         for (title, seconds) in [("Until I stop it", 0), ("1 minute", 60), ("5 minutes", 300), ("15 minutes", 900), ("30 minutes", 1800), ("1 hour", 3600)] {
@@ -126,18 +189,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func start(clip selectedClip: VideoClip? = nil) {
+        if selectedClip == nil { loadClips() }
         guard let clip = selectedClip ?? randomClip() else {
             let alert = NSAlert()
             alert.messageText = "No WinCell videos were found"
-            alert.informativeText = "Rebuild the app to include your video library."
+            alert.informativeText = libraryError ?? "Use Open Video Folder and add a folder for each clip, containing a MOV, MP4, or M4V file and an optional thumbnail.png. Then open the menu again. No rebuild is needed."
+            alert.addButton(withTitle: "Open Video Folder")
+            alert.addButton(withTitle: "Cancel")
             NSApp.activate(ignoringOtherApps: true)
-            alert.runModal()
+            if alert.runModal() == .alertFirstButtonReturn { openVideoFolder() }
             return
         }
         let wasRunning = running
         let previousDeadline = deadline
         if running { stop() }
         currentClip = clip
+        aspectRatio = 768 / 1168
         let queue = AVQueuePlayer()
         queue.isMuted = muted
         player = queue
@@ -167,7 +234,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let clock = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self else { return }
             if let end = self.deadline, Date() >= end { self.stop() }
-            else { self.updateRemaining() }
+            else if self.player?.currentItem?.status == .failed {
+                self.stop()
+                self.showError("This video could not be played", "Use a video supported by macOS, such as H.264, HEVC, or ProRes. Try another file in your video folder.")
+            } else {
+                if let size = self.player?.currentItem?.presentationSize, size.width > 0, size.height > 0 {
+                    let ratio = size.width / size.height
+                    if ratio != self.aspectRatio { self.aspectRatio = ratio; self.reposition() }
+                }
+                self.updateRemaining()
+            }
         }
         timer = clock
         RunLoop.main.add(clock, forMode: .common)
@@ -195,8 +271,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func reposition() {
         guard let screen = NSScreen.screens.first else { return }
         let visible = screen.visibleFrame
-        let h = min(height, visible.height - 32)
-        let w = h * 768 / 1168
+        let h = min(height, visible.height - 32, (visible.width - 32) / aspectRatio)
+        let w = h * aspectRatio
         overlay?.setFrame(NSRect(x: visible.maxX - w - 16, y: visible.minY + 16, width: w, height: h), display: true)
     }
 
@@ -263,6 +339,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         RegisterEventHotKey(UInt32(kVK_ANSI_F), UInt32(cmdKey | optionKey), id, GetApplicationEventTarget(), 0, &hotKey)
     }
 
+    private func libraryTest() {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            let empty = try VideoLibrary.discover(in: root)
+            assert(empty.isEmpty)
+            for name in ["Sample 2", "Sample 10", "Empty", ".Hidden"] {
+                try FileManager.default.createDirectory(at: root.appendingPathComponent(name), withIntermediateDirectories: true)
+            }
+            for name in ["Sample 2/video.mov", "Sample 2/preview.mp4", "Sample 10/clip.MP4", ".Hidden/video.mov", "loose.mov"] {
+                try Data().write(to: root.appendingPathComponent(name))
+            }
+            var found = try VideoLibrary.discover(in: root)
+            assert(found.map(\.title) == ["Sample 2", "Sample 10"])
+            assert(found[0].url.lastPathComponent == "video.mov")
+            assert(found.allSatisfy { $0.thumbnail != nil })
+            try FileManager.default.removeItem(at: root.appendingPathComponent("Sample 2"))
+            found = try VideoLibrary.discover(in: root)
+            assert(found.count == 1 && found[0].title == "Sample 10")
+            print("PASS: empty library, discovery, natural sort, optional thumbnails, hidden files, and deletion refresh")
+        } catch { fatalError("Library test failed: \(error)") }
+        NSApp.terminate(nil)
+    }
+
     private func smokeTest() {
         assert(!clips.isEmpty)
         assert(clips.allSatisfy { $0.thumbnail != nil }, "Each video needs a thumbnail")
@@ -312,6 +412,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [self] in
             assert(player?.currentItem?.status == .readyToPlay, "Video failed: \(clips[index].title)")
             assert((player?.currentTime().seconds ?? 0) > 0, "Video did not advance: \(clips[index].title)")
+            if let size = player?.currentItem?.presentationSize, size.width > 0, size.height > 0 {
+                let expectedRatio = size.width / size.height
+                assert(abs(aspectRatio - expectedRatio) < 0.001, "Video aspect ratio must match the overlay")
+                assert(abs(overlay!.frame.width / overlay!.frame.height - expectedRatio) < 0.001)
+            }
             print("PASS: \(clips[index].title)")
             testLibraryClip(at: index + 1)
         }
